@@ -7,6 +7,16 @@
 #include "board.h"
 #include "nerdaxe.h"
 
+static constexpr uint16_t GAIA_VR_TRACE_CAPACITY = 160;
+
+struct GaiaVrTraceSample {
+    uint32_t tMs = 0;
+    float ioutA = 0.0f;
+    float voutV = 0.0f;
+    uint8_t pgood = 0;
+    uint8_t alertActive = 0;
+};
+
 // Snapshot used by the Gaia VR diagnostic build. It deliberately contains
 // only regulator/board telemetry and no Wi-Fi or pool credentials.
 struct GaiaVrDiagnostics {
@@ -25,11 +35,17 @@ struct GaiaVrDiagnostics {
     float lastNonZeroVoutV = 0.0f;
     float lastVrTempC = 0.0f;
 
+    bool warningObserved = false;
+    uint64_t warningCapturedUs = 0;
+    float warningIoutA = 0.0f;
+    uint8_t warningStatusIout = 0;
+
     float faultIoutA = 0.0f;
     float faultVoutV = 0.0f;
     float faultVrTempC = 0.0f;
     uint16_t faultFrequencyMHz = 0;
     uint16_t faultCoreVoltageMv = 0;
+    uint8_t faultTriggerFlags = 0;
 
     uint16_t statusWord = 0xffff;
     uint8_t statusByte = 0xff;
@@ -38,6 +54,10 @@ struct GaiaVrDiagnostics {
     uint8_t statusInput = 0xff;
     uint8_t statusTemperature = 0xff;
     uint8_t statusMfrSpecific = 0xff;
+
+    uint16_t traceCount = 0;
+    uint16_t traceWriteIndex = 0;
+    GaiaVrTraceSample trace[GAIA_VR_TRACE_CAPACITY] = {};
 };
 
 class NerdaxeGaia : public NerdAxe {
@@ -83,7 +103,7 @@ class NerdaxeGaia : public NerdAxe {
     virtual Board::Error getFault(uint32_t *status) override;
 
     void startVrDiagnosticMonitor();
-    GaiaVrDiagnostics getVrDiagnostics() const { return m_vrDiagnostics; }
+    const GaiaVrDiagnostics &getVrDiagnostics() const { return m_vrDiagnostics; }
 
     virtual bool hasEthernet() override { return m_hasEth; }
     virtual const EthPins *getEthPins() override;

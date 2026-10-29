@@ -9,6 +9,7 @@ SRCS
     "boards/nerdaxe.cpp"
     "boards/nerdaxegamma.cpp"
     "boards/nerdaxegaia.cpp"
+    "boards/gaia_vr_diagnostic.cpp"
     "boards/nerdqaxeplus.cpp"
     "boards/nerdqaxeplus2.cpp"
     "boards/nerdoctaxeplus.cpp"

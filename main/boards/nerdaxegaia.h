@@ -9,6 +9,16 @@
 
 static constexpr uint16_t GAIA_VR_TRACE_CAPACITY = 160;
 
+// Implemented by the diagnostic translation unit. This is called when the
+// NerdaxeGaia object itself is constructed inside app_main, i.e. after the
+// FreeRTOS scheduler is available. That is more reliable than creating a task
+// from a global C++ constructor during early startup.
+void gaiaVrDiagnosticEnsureBootstrap();
+
+struct GaiaVrDiagAutoStart {
+    GaiaVrDiagAutoStart() { gaiaVrDiagnosticEnsureBootstrap(); }
+};
+
 struct GaiaVrTraceSample {
     uint32_t tMs = 0;
     float ioutA = 0.0f;
@@ -71,6 +81,7 @@ class NerdaxeGaia : public NerdAxe {
     void LDO_enable();
     void LDO_disable();
 
+    GaiaVrDiagAutoStart m_vrDiagAutoStart;
     GaiaVrDiagnostics m_vrDiagnostics;
     bool m_vrDiagTaskRunning = false;
     void resetVrDiagnostics();

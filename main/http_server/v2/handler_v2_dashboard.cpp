@@ -20,9 +20,10 @@ static const char *TAG = "http_v2_dashboard";
 
 static void addGaiaVrDiagnostics(JsonObject diag, NerdaxeGaia *gaia)
 {
-    const GaiaVrDiagnostics d = gaia->getVrDiagnostics();
+    const GaiaVrDiagnostics &d = gaia->getVrDiagnostics();
 
     diag["diagnosticBuild"] = true;
+    diag["traceVersion"] = 3;
     diag["faultLatched"] = d.faultLatched;
     diag["fault"] = (int)d.fault;
     diag["faultText"] = Board::errorToStr(d.fault);
@@ -37,13 +38,21 @@ static void addGaiaVrDiagnostics(JsonObject diag, NerdaxeGaia *gaia)
     diag["lastNonZeroVoutV"] = d.lastNonZeroVoutV;
     diag["lastVrTempC"] = d.lastVrTempC;
 
+    diag["warningObserved"] = d.warningObserved;
+    diag["warningCapturedUs"] = d.warningCapturedUs;
+    diag["warningIoutA"] = d.warningIoutA;
+
+    char hex[8];
+    snprintf(hex, sizeof(hex), "%02X", d.warningStatusIout);
+    diag["warningStatusIout"] = hex;
+
     diag["faultIoutA"] = d.faultIoutA;
     diag["faultVoutV"] = d.faultVoutV;
     diag["faultVrTempC"] = d.faultVrTempC;
     diag["faultFrequencyMHz"] = d.faultFrequencyMHz;
     diag["faultCoreVoltageMv"] = d.faultCoreVoltageMv;
+    diag["faultTriggerFlags"] = d.faultTriggerFlags;
 
-    char hex[8];
     snprintf(hex, sizeof(hex), "%04X", d.statusWord);
     diag["statusWord"] = hex;
     snprintf(hex, sizeof(hex), "%02X", d.statusByte);
@@ -59,10 +68,26 @@ static void addGaiaVrDiagnostics(JsonObject diag, NerdaxeGaia *gaia)
     snprintf(hex, sizeof(hex), "%02X", d.statusMfrSpecific);
     diag["statusMfrSpecific"] = hex;
 
-    // These are intentionally included in the report so it is obvious that the
-    // diagnostic firmware did NOT alter the Gaia regulator protection settings.
     diag["ioutWarnLimitA"] = 28.0f;
     diag["ioutFaultLimitA"] = 33.0f;
+    diag["traceSampleIntervalMs"] = 10;
+    diag["traceCount"] = d.traceCount;
+
+    JsonArray trace = diag["trace"].to<JsonArray>();
+    const uint16_t count = d.traceCount;
+    const uint16_t start = (count < GAIA_VR_TRACE_CAPACITY)
+                               ? 0
+                               : d.traceWriteIndex;
+    for (uint16_t i = 0; i < count; ++i) {
+        const uint16_t idx = (start + i) % GAIA_VR_TRACE_CAPACITY;
+        const GaiaVrTraceSample &s = d.trace[idx];
+        JsonObject item = trace.add<JsonObject>();
+        item["tMs"] = s.tMs;
+        item["ioutA"] = s.ioutA;
+        item["voutV"] = s.voutV;
+        item["pgood"] = s.pgood;
+        item["alert"] = s.alertActive;
+    }
 }
 
 esp_err_t GET_V2_dashboard(httpd_req_t *req)
@@ -79,7 +104,6 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         return ESP_FAIL;
     }
 
-    // Parse optional history query params (same as /api/system/info)
     const uint64_t DEFAULT_HISTORY_SPAN_MS = 3600ULL * 1000ULL;
     const uint64_t MAX_HISTORY_SPAN_MS     = 3ULL * 3600ULL * 1000ULL;
     uint64_t start_timestamp   = 0;
@@ -132,7 +156,6 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
     (void)gaia_diag_only;
 #endif
 
-    // --- system ---
     {
         JsonObject sys = doc["system"].to<JsonObject>();
         sys["uptime"]       = (esp_timer_get_time() - SYSTEM_MODULE.getStartTime()) / 1000000;
@@ -141,7 +164,6 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         sys["overheatTemp"] = Config::getOverheatTemp();
     }
 
-    // --- performance ---
     {
         JsonObject perf = doc["performance"].to<JsonObject>();
         perf["hashRateTimestamp"] = history->getCurrentTimestamp();
@@ -166,7 +188,6 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         }
     }
 
-    // --- power ---
     {
         JsonObject pwr = doc["power"].to<JsonObject>();
         pwr["watts"]             = POWER_MANAGEMENT_MODULE.getPower();
@@ -181,7 +202,6 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         pwr["coreVoltageActual"] = board->getVout();
     }
 
-    // --- thermal ---
     {
         JsonObject therm = doc["thermal"].to<JsonObject>();
         therm["asicTemp"]  = POWER_MANAGEMENT_MODULE.getChipTempMax();
@@ -211,7 +231,6 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
     }
 #endif
 
-    // --- stratum ---
     {
         JsonObject stratum = doc["stratum"].to<JsonObject>();
         STRATUM_MANAGER->getManagerInfoJson(stratum, true);
@@ -234,14 +253,12 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         }
     }
 
-    // --- can ---
     {
         JsonObject can = doc["can"].to<JsonObject>();
         can["hasExtension"] = board->hasCanExtension();
         can["enabled"]      = Config::isCanEnabled();
     }
 
-    // --- coinbase ---
     {
         JsonObject coinbase = doc["coinbase"].to<JsonObject>();
 

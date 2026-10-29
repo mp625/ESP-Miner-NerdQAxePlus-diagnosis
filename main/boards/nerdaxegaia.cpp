@@ -4,13 +4,16 @@
 #include "nvs_config.h"
 #include "nerdaxegaia.h"
 
+#include "drivers/i2c_master.h"
 #include "drivers/nerdaxe/DS4432U.h"
 #include "drivers/nerdaxe/EMC2101.h"
 #include "drivers/nerdaxe/INA260.h"
 #include "drivers/nerdaxe/adc.h"
 #include "drivers/nerdaxe/TPS546.h"
+#include "drivers/nerdaxe/pmbus_commands.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #define BM1373_RST_PIN GPIO_NUM_1
 #define LDO_EN_PIN GPIO_NUM_12   // LDO enable (active-high) — new Gaia board
@@ -21,6 +24,29 @@ bool tempinit_gaia = false;
 static const char* TAG="nerdaxeGaia";
 
 #define MAX(a,b) ((a)>(b)?(a):(b))
+
+// Direct PMBus status reads used by the diagnostic build.  The normal TPS546
+// driver keeps its SMBus helpers private; using the shared I2C wrapper here lets
+// Gaia inspect the standard latched status registers without changing any TPS
+// configuration or protection limits.
+static uint8_t gaia_pmbus_read_byte(uint8_t command)
+{
+    uint8_t value = 0xff;
+    if (i2c_master_register_read(TPS546_I2CADDR, command, &value, 1) != ESP_OK) {
+        return 0xff;
+    }
+    return value;
+}
+
+static uint16_t gaia_pmbus_read_word(uint8_t command)
+{
+    uint8_t data[2] = {0xff, 0xff};
+    if (i2c_master_register_read(TPS546_I2CADDR, command, data, sizeof(data)) != ESP_OK) {
+        return 0xffff;
+    }
+    // PMBus word reads are LSB first.
+    return (static_cast<uint16_t>(data[1]) << 8) | data[0];
+}
 
 // W5500 ethernet interposer pins (see eth-interposer FIRMWARE-GAIA.md):
 // SCLK=GPIO10 (JP2 2-3), MOSI=GPIO3 (JP3 2-3), MISO=GPIO16, CS=GPIO21.
@@ -91,6 +117,10 @@ NerdaxeGaia::NerdaxeGaia() : NerdAxe() {
     m_hasEth = isEthConnected();
 }
 
+void NerdaxeGaia::resetVrDiagnostics()
+{
+    m_vrDiagnostics = GaiaVrDiagnostics{};
+}
 
 bool NerdaxeGaia::initBoard()
 {
@@ -175,6 +205,8 @@ void NerdaxeGaia::LDO_disable() {
 
 bool NerdaxeGaia::initAsics() {
 
+    resetVrDiagnostics();
+
     // Core buck off, but keep the LDO ON (already enabled in initBoard and
     // never cycled): the chip runs on the LDO alone during the self-test, so
     // cutting it here — as the old sequence did — left the chip unpowered and
@@ -257,6 +289,10 @@ float NerdaxeGaia::getVRTemp() {
     //Reading voltage regulator temp
     float vr_temp = TPS546_get_temperature();
     ESP_LOGI(TAG, "Read vr temp = %.3fºC", vr_temp);
+    if (isfinite(vr_temp)) {
+        m_vrDiagnostics.lastVrTempC = vr_temp;
+        m_vrDiagnostics.lastSampleUs = esp_timer_get_time();
+    }
     return vr_temp; //- vr_temp (voltage regulator temp)
 }
 
@@ -274,18 +310,116 @@ float NerdaxeGaia::getIin() {
 }
 
 float NerdaxeGaia::getPin() {
-    return (TPS546_get_vout() * TPS546_get_iout()) + GAIA_POWER_OFFSET;
+    const float vout = TPS546_get_vout();
+    const float iout = getIout();
+    return (vout * iout) + GAIA_POWER_OFFSET;
 }
 
 float NerdaxeGaia::getVout() {
-    return ADC_get_vcore() / 1000.0;
+    float vout = ADC_get_vcore() / 1000.0f;
+    if (isfinite(vout)) {
+        m_vrDiagnostics.lastVoutV = vout;
+        if (vout > 0.05f) {
+            m_vrDiagnostics.lastNonZeroVoutV = vout;
+        }
+        m_vrDiagnostics.lastSampleUs = esp_timer_get_time();
+    }
+    return vout;
 }
 
 float NerdaxeGaia::getIout() {
-    return TPS546_get_iout();
+    float iout = TPS546_get_iout();
+    if (isfinite(iout)) {
+        m_vrDiagnostics.lastIoutA = iout;
+        if (iout > 0.05f) {
+            m_vrDiagnostics.lastNonZeroIoutA = iout;
+            if (iout > m_vrDiagnostics.maxIoutA) {
+                m_vrDiagnostics.maxIoutA = iout;
+            }
+        }
+        m_vrDiagnostics.sampleCount++;
+        m_vrDiagnostics.lastSampleUs = esp_timer_get_time();
+    }
+    return iout;
 }
 
 float NerdaxeGaia::getPout() {
     return getPin();
 }
 
+Board::Error NerdaxeGaia::getFault(uint32_t *status)
+{
+    const uint16_t status_word = gaia_pmbus_read_word(PMBUS_STATUS_WORD);
+    const uint8_t status_byte = gaia_pmbus_read_byte(PMBUS_STATUS_BYTE);
+    const uint8_t status_iout = gaia_pmbus_read_byte(PMBUS_STATUS_IOUT);
+    const uint8_t status_vout = gaia_pmbus_read_byte(PMBUS_STATUS_VOUT);
+    const uint8_t status_input = gaia_pmbus_read_byte(PMBUS_STATUS_INPUT);
+    const uint8_t status_temp = gaia_pmbus_read_byte(PMBUS_STATUS_TEMPERATURE);
+    const uint8_t status_mfr = gaia_pmbus_read_byte(PMBUS_STATUS_MFR_SPECIFIC);
+
+    *status = (static_cast<uint32_t>(status_byte) << 24) |
+              (static_cast<uint32_t>(status_iout) << 16) |
+              (static_cast<uint32_t>(status_vout) << 8) |
+              static_cast<uint32_t>(status_input);
+
+    Board::Error error = Board::Error::NONE;
+
+    // If the regulator itself cannot be reached, every PMBus status read comes
+    // back as 0xFF.  Treat that separately from a real latched fault bit.
+    if (status_word == 0xffff && status_byte == 0xff && status_iout == 0xff &&
+        status_vout == 0xff && status_input == 0xff && status_temp == 0xff && status_mfr == 0xff) {
+        error = Board::Error::PSU_FAULT;
+    } else if (status_iout != 0xff && (status_iout & 0x80)) {
+        // PMBus STATUS_IOUT bit 7 = output over-current fault.
+        error = Board::Error::IOUT_OC_FAULT;
+    } else if (status_vout != 0xff && (status_vout & 0x90)) {
+        // Bit 7 = VOUT over-voltage fault, bit 4 = VOUT under-voltage fault.
+        error = Board::Error::VOUT_FAULT;
+    } else if (status_temp != 0xff && (status_temp & 0x80)) {
+        // Bit 7 = over-temperature fault.
+        error = Board::Error::VREG_TEMP_FAULT;
+    } else if (status_input != 0xff && (status_input & 0x94)) {
+        // Bit 7 = VIN OV fault, bit 4 = VIN UV fault, bit 2 = IIN OC fault.
+        error = Board::Error::PSU_FAULT;
+    }
+
+    // Keep a frozen copy of the first regulator fault.  PMBus fault bits are
+    // latched, but freezing the report also protects it from later UI/settings
+    // activity and gives us the exact configuration that was active at capture.
+    if (error != Board::Error::NONE && !m_vrDiagnostics.faultLatched) {
+        m_vrDiagnostics.faultLatched = true;
+        m_vrDiagnostics.fault = error;
+        m_vrDiagnostics.faultCapturedUs = esp_timer_get_time();
+        m_vrDiagnostics.faultFrequencyMHz = static_cast<uint16_t>(m_asicFrequency);
+        m_vrDiagnostics.faultCoreVoltageMv = static_cast<uint16_t>(m_asicVoltageMillis);
+        m_vrDiagnostics.faultIoutA = TPS546_get_iout();
+        m_vrDiagnostics.faultVoutV = ADC_get_vcore() / 1000.0f;
+        m_vrDiagnostics.faultVrTempC = TPS546_get_temperature();
+
+        m_vrDiagnostics.statusWord = status_word;
+        m_vrDiagnostics.statusByte = status_byte;
+        m_vrDiagnostics.statusIout = status_iout;
+        m_vrDiagnostics.statusVout = status_vout;
+        m_vrDiagnostics.statusInput = status_input;
+        m_vrDiagnostics.statusTemperature = status_temp;
+        m_vrDiagnostics.statusMfrSpecific = status_mfr;
+
+        ESP_LOGE(TAG,
+                 "VR diagnostic fault captured: error=%s word=%04X byte=%02X iout=%02X vout=%02X input=%02X temp=%02X mfr=%02X lastIout=%.2fA maxIout=%.2fA lastVout=%.3fV vrTemp=%.2fC",
+                 Board::errorToStr(error), status_word, status_byte, status_iout, status_vout, status_input,
+                 status_temp, status_mfr, m_vrDiagnostics.lastNonZeroIoutA, m_vrDiagnostics.maxIoutA,
+                 m_vrDiagnostics.lastNonZeroVoutV, m_vrDiagnostics.faultVrTempC);
+    } else if (!m_vrDiagnostics.faultLatched) {
+        // Before a fault, retain the latest status values so the endpoint is
+        // still useful while the unit is running normally.
+        m_vrDiagnostics.statusWord = status_word;
+        m_vrDiagnostics.statusByte = status_byte;
+        m_vrDiagnostics.statusIout = status_iout;
+        m_vrDiagnostics.statusVout = status_vout;
+        m_vrDiagnostics.statusInput = status_input;
+        m_vrDiagnostics.statusTemperature = status_temp;
+        m_vrDiagnostics.statusMfrSpecific = status_mfr;
+    }
+
+    return error;
+}

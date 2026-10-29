@@ -7,7 +7,7 @@
 #include "board.h"
 #include "nerdaxe.h"
 
-// Snapshot used by the Gaia VR diagnostic build.  It deliberately contains
+// Snapshot used by the Gaia VR diagnostic build. It deliberately contains
 // only regulator/board telemetry and no Wi-Fi or pool credentials.
 struct GaiaVrDiagnostics {
     bool faultLatched = false;
@@ -52,7 +52,9 @@ class NerdaxeGaia : public NerdAxe {
     void LDO_disable();
 
     GaiaVrDiagnostics m_vrDiagnostics;
+    bool m_vrDiagTaskRunning = false;
     void resetVrDiagnostics();
+    static void vrDiagnosticTask(void *arg);
 
   public:
     NerdaxeGaia();
@@ -75,7 +77,7 @@ class NerdaxeGaia : public NerdAxe {
     virtual float getIout();
     virtual float getPout();
 
-    // Decode latched TPS546D24A PMBus fault registers.  The common power
+    // Decode latched TPS546D24A PMBus fault registers. The common power
     // management task already calls getFault() every telemetry cycle; Gaia did
     // not previously override it, so regulator faults were invisible there.
     virtual Board::Error getFault(uint32_t *status) override;

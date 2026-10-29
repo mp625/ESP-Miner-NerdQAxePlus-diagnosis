@@ -17,7 +17,7 @@
 #define GAIA_PGOOD_PIN GPIO_NUM_11
 #define GAIA_PMB_ALERT_PIN GPIO_NUM_13
 
-static const char *TAG = "gaiaVrDiagV3";
+static const char *TAG = "gaiaVrDiagV4";
 
 static uint8_t diag_read_byte(uint8_t command)
 {
@@ -137,8 +137,6 @@ void NerdaxeGaia::vrDiagnosticTask(void *arg)
         }
 
         if (activeWindow && !gaia->m_vrDiagnostics.faultLatched) {
-            // 100 Hz current sampling. Vcore and GPIOs are sampled on the same pass.
-            // This is read-only; the regulator protection settings are unchanged.
             if (lastIoutReadUs == 0 || (nowUs - lastIoutReadUs) >= 10000ULL) {
                 const float iout = TPS546_get_iout();
                 lastIoutReadUs = nowUs;
@@ -198,31 +196,14 @@ void NerdaxeGaia::vrDiagnosticTask(void *arg)
                 gaia->m_vrDiagnostics.statusTemperature = statusTemp;
                 gaia->m_vrDiagnostics.statusMfrSpecific = statusMfr;
 
-                // Store one final point using the immediate fault measurements.
                 push_trace(gaia->m_vrDiagnostics, nowUs, windowStartUs,
                            gaia->m_vrDiagnostics.faultIoutA,
                            gaia->m_vrDiagnostics.faultVoutV,
                            pgood, alertActive);
-
-                ESP_LOGE(TAG,
-                         "DENSE CAPTURE trigger=%u dt=%.3fms Vcore=%.3fV Iout=%.2fA maxIout=%.2fA PGOOD=%d ALERT=%d WORD=%04X BYTE=%02X IOUT=%02X VOUT=%02X INPUT=%02X TEMP=%02X MFR=%02X trace=%u",
-                         gaia->m_vrDiagnostics.faultTriggerFlags,
-                         (nowUs - windowStartUs) / 1000.0,
-                         gaia->m_vrDiagnostics.faultVoutV,
-                         gaia->m_vrDiagnostics.faultIoutA,
-                         gaia->m_vrDiagnostics.maxIoutA,
-                         (int)pgood, (int)alertActive,
-                         statusWord, statusByte, statusIout, statusVout,
-                         statusInput, statusTemp, statusMfr,
-                         gaia->m_vrDiagnostics.traceCount);
             }
 
             previousPgood = pgood;
             previousAlertInactive = alertInactive;
-
-            if ((nowUs - windowStartUs) > 15000000ULL && vout > 0.20f) {
-                activeWindow = false;
-            }
         }
 
         if (activeWindow && vout < 0.05f && !gaia->m_vrDiagnostics.faultLatched) {
@@ -238,16 +219,21 @@ static void gaia_diag_bootstrap(void *)
     for (;;) {
         Board *board = SYSTEM_MODULE.getBoard();
         if (board && strcmp(board->getDeviceModel(), "NerdAxeGaia") == 0) {
-            vTaskDelay(pdMS_TO_TICKS(250));
+            vTaskDelay(pdMS_TO_TICKS(100));
             static_cast<NerdaxeGaia *>(board)->startVrDiagnosticMonitor();
             vTaskDelete(nullptr);
         }
-        vTaskDelay(pdMS_TO_TICKS(50));
+        vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
-__attribute__((constructor)) static void gaia_diag_register_bootstrap()
+void gaiaVrDiagnosticEnsureBootstrap()
 {
+    static bool started = false;
+    if (started) {
+        return;
+    }
+    started = true;
 #ifdef NERDAXEGAIA
     xTaskCreate(gaia_diag_bootstrap, "gaia diag bootstrap", 2048, nullptr, 2, nullptr);
 #endif

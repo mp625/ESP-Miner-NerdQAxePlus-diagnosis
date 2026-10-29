@@ -82,6 +82,7 @@ class NerdaxeGaia : public NerdAxe {
     // not previously override it, so regulator faults were invisible there.
     virtual Board::Error getFault(uint32_t *status) override;
 
+    void startVrDiagnosticMonitor();
     GaiaVrDiagnostics getVrDiagnostics() const { return m_vrDiagnostics; }
 
     virtual bool hasEthernet() override { return m_hasEth; }

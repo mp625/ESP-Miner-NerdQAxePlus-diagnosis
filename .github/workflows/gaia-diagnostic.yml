@@ -1,0 +1,58 @@
+name: Build Gaia VR Diagnostic Firmware
+
+on:
+  push:
+    branches:
+      - gaia-vr-diagnostics
+  workflow_dispatch:
+
+jobs:
+  build-gaia-diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Record source commit
+        run: git rev-parse --short HEAD > version.txt
+
+      - name: Set ESP32-S3 target
+        run: |
+          docker run --rm --user root \
+            -e BOARD=NERDAXEGAIA \
+            -v $PWD:/home/builder/project \
+            shufps/esp-idf-builder:5.3.6 idf.py set-target esp32s3
+
+      - name: Compile NerdAxe Gaia diagnostic firmware
+        run: |
+          docker run --rm --user root \
+            -e BOARD=NERDAXEGAIA \
+            -v $PWD:/home/builder/project \
+            shufps/esp-idf-builder:5.3.6 bash -c 'idf.py build'
+
+      - name: Merge factory binary
+        run: |
+          docker run --rm --user root \
+            -v $PWD:/home/builder/project \
+            shufps/esp-idf-builder:5.3.6 esptool.py --chip esp32s3 merge_bin \
+            --flash_mode dio --flash_size 16MB --flash_freq 80m \
+            0x0 build/bootloader/bootloader.bin \
+            0x8000 build/partition_table/partition-table.bin \
+            0x10000 build/esp-miner.bin \
+            0x410000 build/www.bin \
+            0xf10000 build/ota_data_initial.bin \
+            -o esp-miner-factory-NerdAxeGaia-VR-diagnostic.bin
+
+      - name: Rename OTA firmware
+        run: cp build/esp-miner.bin esp-miner-NerdAxeGaia-VR-diagnostic.bin
+
+      - name: Upload Gaia diagnostic binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: NerdAxeGaia-VR-diagnostic
+          path: |
+            esp-miner-NerdAxeGaia-VR-diagnostic.bin
+            esp-miner-factory-NerdAxeGaia-VR-diagnostic.bin
+          retention-days: 14

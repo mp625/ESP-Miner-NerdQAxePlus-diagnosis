@@ -17,7 +17,7 @@
 #define GAIA_PGOOD_PIN GPIO_NUM_11
 #define GAIA_PMB_ALERT_PIN GPIO_NUM_13
 
-static const char *TAG = "gaiaVrDiagV2";
+static const char *TAG = "gaiaVrDiagV3";
 
 static uint8_t diag_read_byte(uint8_t command)
 {
@@ -57,6 +57,22 @@ static Board::Error decode_fault(uint8_t statusIout,
     return Board::Error::NONE;
 }
 
+static void push_trace(GaiaVrDiagnostics &d, uint64_t nowUs, uint64_t windowStartUs,
+                       float iout, float vout, bool pgood, bool alertActive)
+{
+    GaiaVrTraceSample &s = d.trace[d.traceWriteIndex];
+    s.tMs = static_cast<uint32_t>((nowUs - windowStartUs) / 1000ULL);
+    s.ioutA = iout;
+    s.voutV = vout;
+    s.pgood = pgood ? 1 : 0;
+    s.alertActive = alertActive ? 1 : 0;
+
+    d.traceWriteIndex = (d.traceWriteIndex + 1) % GAIA_VR_TRACE_CAPACITY;
+    if (d.traceCount < GAIA_VR_TRACE_CAPACITY) {
+        d.traceCount++;
+    }
+}
+
 void NerdaxeGaia::startVrDiagnosticMonitor()
 {
     if (m_vrDiagTaskRunning) {
@@ -79,19 +95,21 @@ void NerdaxeGaia::vrDiagnosticTask(void *arg)
     io.intr_type = GPIO_INTR_DISABLE;
     gpio_config(&io);
 
-    ESP_LOGI(TAG, "V2 monitor armed: PGOOD=GPIO11, PMB_ALERT=GPIO13");
+    ESP_LOGI(TAG, "dense trace armed: PGOOD=GPIO11, PMB_ALERT=GPIO13, OCP remains 28A/33A");
 
     bool activeWindow = false;
     bool previousPgood = false;
-    bool previousAlert = true;
+    bool previousAlertInactive = true;
     uint64_t windowStartUs = 0;
     uint64_t lastIoutReadUs = 0;
+    float lastIout = 0.0f;
 
     for (;;) {
         const uint64_t nowUs = esp_timer_get_time();
         const float vout = ADC_get_vcore() / 1000.0f;
         const bool pgood = gpio_get_level(GAIA_PGOOD_PIN) != 0;
-        const bool alertInactive = gpio_get_level(GAIA_PMB_ALERT_PIN) != 0; // ALERT is active-low
+        const bool alertInactive = gpio_get_level(GAIA_PMB_ALERT_PIN) != 0;
+        const bool alertActive = !alertInactive;
 
         if (!gaia->m_vrDiagnostics.faultLatched) {
             gaia->m_vrDiagnostics.lastSampleUs = nowUs;
@@ -104,18 +122,28 @@ void NerdaxeGaia::vrDiagnosticTask(void *arg)
         if (!activeWindow && vout > 0.20f) {
             activeWindow = true;
             windowStartUs = nowUs;
+            lastIoutReadUs = 0;
+            lastIout = 0.0f;
             previousPgood = pgood;
-            previousAlert = alertInactive;
-            ESP_LOGI(TAG, "startup window detected at Vcore=%.3fV PGOOD=%d ALERT=%d",
-                     vout, (int)pgood, (int)!alertInactive);
+            previousAlertInactive = alertInactive;
+            gaia->m_vrDiagnostics.traceCount = 0;
+            gaia->m_vrDiagnostics.traceWriteIndex = 0;
+            gaia->m_vrDiagnostics.warningObserved = false;
+            gaia->m_vrDiagnostics.warningCapturedUs = 0;
+            gaia->m_vrDiagnostics.warningIoutA = 0.0f;
+            gaia->m_vrDiagnostics.warningStatusIout = 0;
+            ESP_LOGI(TAG, "trace window started at Vcore=%.3fV PGOOD=%d ALERT=%d",
+                     vout, (int)pgood, (int)alertActive);
         }
 
         if (activeWindow && !gaia->m_vrDiagnostics.faultLatched) {
-            // Read current at 20 Hz during the critical startup window.
-            if ((nowUs - lastIoutReadUs) >= 50000ULL) {
+            // 100 Hz current sampling. Vcore and GPIOs are sampled on the same pass.
+            // This is read-only; the regulator protection settings are unchanged.
+            if (lastIoutReadUs == 0 || (nowUs - lastIoutReadUs) >= 10000ULL) {
                 const float iout = TPS546_get_iout();
                 lastIoutReadUs = nowUs;
                 if (isfinite(iout)) {
+                    lastIout = iout;
                     gaia->m_vrDiagnostics.lastIoutA = iout;
                     if (iout > 0.05f) {
                         gaia->m_vrDiagnostics.lastNonZeroIoutA = iout;
@@ -125,15 +153,24 @@ void NerdaxeGaia::vrDiagnosticTask(void *arg)
                     }
                     gaia->m_vrDiagnostics.sampleCount++;
                 }
+
+                const uint8_t statusIoutNow = diag_read_byte(PMBUS_STATUS_IOUT);
+                if (!gaia->m_vrDiagnostics.warningObserved && statusIoutNow != 0xff && (statusIoutNow & 0x20)) {
+                    gaia->m_vrDiagnostics.warningObserved = true;
+                    gaia->m_vrDiagnostics.warningCapturedUs = nowUs;
+                    gaia->m_vrDiagnostics.warningIoutA = lastIout;
+                    gaia->m_vrDiagnostics.warningStatusIout = statusIoutNow;
+                    ESP_LOGW(TAG, "IOUT warning observed at %.2fA, status=%02X", lastIout, statusIoutNow);
+                }
+
+                push_trace(gaia->m_vrDiagnostics, nowUs, windowStartUs, lastIout, vout, pgood, alertActive);
             }
 
             const bool pgoodFell = previousPgood && !pgood;
-            const bool alertAsserted = previousAlert && !alertInactive;
+            const bool alertAsserted = previousAlertInactive && alertActive;
             const bool vcoreCollapsed = gaia->m_vrDiagnostics.lastNonZeroVoutV > 0.20f && vout < 0.10f;
 
             if (pgoodFell || alertAsserted || vcoreCollapsed) {
-                // Read the PMBus status immediately, before the regular telemetry task
-                // or later recovery activity can obscure the originating fault bits.
                 const uint16_t statusWord = diag_read_word(PMBUS_STATUS_WORD);
                 const uint8_t statusByte = diag_read_byte(PMBUS_STATUS_BYTE);
                 const uint8_t statusIout = diag_read_byte(PMBUS_STATUS_IOUT);
@@ -147,6 +184,9 @@ void NerdaxeGaia::vrDiagnosticTask(void *arg)
                 gaia->m_vrDiagnostics.faultCapturedUs = nowUs;
                 gaia->m_vrDiagnostics.faultFrequencyMHz = static_cast<uint16_t>(gaia->m_asicFrequency);
                 gaia->m_vrDiagnostics.faultCoreVoltageMv = static_cast<uint16_t>(gaia->m_asicVoltageMillis);
+                gaia->m_vrDiagnostics.faultTriggerFlags = (pgoodFell ? 1 : 0) |
+                                                          (alertAsserted ? 2 : 0) |
+                                                          (vcoreCollapsed ? 4 : 0);
                 gaia->m_vrDiagnostics.faultIoutA = TPS546_get_iout();
                 gaia->m_vrDiagnostics.faultVoutV = ADC_get_vcore() / 1000.0f;
                 gaia->m_vrDiagnostics.faultVrTempC = TPS546_get_temperature();
@@ -158,25 +198,28 @@ void NerdaxeGaia::vrDiagnosticTask(void *arg)
                 gaia->m_vrDiagnostics.statusTemperature = statusTemp;
                 gaia->m_vrDiagnostics.statusMfrSpecific = statusMfr;
 
+                // Store one final point using the immediate fault measurements.
+                push_trace(gaia->m_vrDiagnostics, nowUs, windowStartUs,
+                           gaia->m_vrDiagnostics.faultIoutA,
+                           gaia->m_vrDiagnostics.faultVoutV,
+                           pgood, alertActive);
+
                 ESP_LOGE(TAG,
-                         "FAST CAPTURE trigger=%s%s%s dt=%.3fms Vcore=%.3fV Iout=%.2fA maxIout=%.2fA PGOOD=%d ALERT=%d WORD=%04X BYTE=%02X IOUT=%02X VOUT=%02X INPUT=%02X TEMP=%02X MFR=%02X",
-                         pgoodFell ? "PGOOD " : "",
-                         alertAsserted ? "ALERT " : "",
-                         vcoreCollapsed ? "VCORE " : "",
+                         "DENSE CAPTURE trigger=%u dt=%.3fms Vcore=%.3fV Iout=%.2fA maxIout=%.2fA PGOOD=%d ALERT=%d WORD=%04X BYTE=%02X IOUT=%02X VOUT=%02X INPUT=%02X TEMP=%02X MFR=%02X trace=%u",
+                         gaia->m_vrDiagnostics.faultTriggerFlags,
                          (nowUs - windowStartUs) / 1000.0,
                          gaia->m_vrDiagnostics.faultVoutV,
                          gaia->m_vrDiagnostics.faultIoutA,
                          gaia->m_vrDiagnostics.maxIoutA,
-                         (int)pgood, (int)!alertInactive,
+                         (int)pgood, (int)alertActive,
                          statusWord, statusByte, statusIout, statusVout,
-                         statusInput, statusTemp, statusMfr);
+                         statusInput, statusTemp, statusMfr,
+                         gaia->m_vrDiagnostics.traceCount);
             }
 
             previousPgood = pgood;
-            previousAlert = alertInactive;
+            previousAlertInactive = alertInactive;
 
-            // If startup completed without a fault, keep watching until the next
-            // Vcore cycle instead of continuously polling the regulator forever.
             if ((nowUs - windowStartUs) > 15000000ULL && vout > 0.20f) {
                 activeWindow = false;
             }
@@ -186,14 +229,10 @@ void NerdaxeGaia::vrDiagnosticTask(void *arg)
             activeWindow = false;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
-// Start a tiny bootstrap task before app_main. It does not touch the board until
-// SYSTEM_MODULE has installed a NerdAxeGaia instance and initBoard() has had time
-// to initialize GPIO/I2C. This keeps the diagnostic patch isolated from normal
-// startup sequencing.
 static void gaia_diag_bootstrap(void *)
 {
     for (;;) {

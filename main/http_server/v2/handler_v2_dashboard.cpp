@@ -1,5 +1,7 @@
 #include "handler_v2_dashboard.h"
 
+#include <cstring>
+
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -12,8 +14,56 @@
 #include "http_utils.h"
 #include "ping_task.h"
 #include "tasks/can_master_task.h"
+#include "boards/nerdaxegaia.h"
 
 static const char *TAG = "http_v2_dashboard";
+
+static void addGaiaVrDiagnostics(JsonObject diag, NerdaxeGaia *gaia)
+{
+    const GaiaVrDiagnostics d = gaia->getVrDiagnostics();
+
+    diag["diagnosticBuild"] = true;
+    diag["faultLatched"] = d.faultLatched;
+    diag["fault"] = (int)d.fault;
+    diag["faultText"] = Board::errorToStr(d.fault);
+    diag["lastSampleUs"] = d.lastSampleUs;
+    diag["faultCapturedUs"] = d.faultCapturedUs;
+    diag["sampleCount"] = d.sampleCount;
+
+    diag["lastIoutA"] = d.lastIoutA;
+    diag["lastNonZeroIoutA"] = d.lastNonZeroIoutA;
+    diag["maxIoutA"] = d.maxIoutA;
+    diag["lastVoutV"] = d.lastVoutV;
+    diag["lastNonZeroVoutV"] = d.lastNonZeroVoutV;
+    diag["lastVrTempC"] = d.lastVrTempC;
+
+    diag["faultIoutA"] = d.faultIoutA;
+    diag["faultVoutV"] = d.faultVoutV;
+    diag["faultVrTempC"] = d.faultVrTempC;
+    diag["faultFrequencyMHz"] = d.faultFrequencyMHz;
+    diag["faultCoreVoltageMv"] = d.faultCoreVoltageMv;
+
+    char hex[8];
+    snprintf(hex, sizeof(hex), "%04X", d.statusWord);
+    diag["statusWord"] = hex;
+    snprintf(hex, sizeof(hex), "%02X", d.statusByte);
+    diag["statusByte"] = hex;
+    snprintf(hex, sizeof(hex), "%02X", d.statusIout);
+    diag["statusIout"] = hex;
+    snprintf(hex, sizeof(hex), "%02X", d.statusVout);
+    diag["statusVout"] = hex;
+    snprintf(hex, sizeof(hex), "%02X", d.statusInput);
+    diag["statusInput"] = hex;
+    snprintf(hex, sizeof(hex), "%02X", d.statusTemperature);
+    diag["statusTemperature"] = hex;
+    snprintf(hex, sizeof(hex), "%02X", d.statusMfrSpecific);
+    diag["statusMfrSpecific"] = hex;
+
+    // These are intentionally included in the report so it is obvious that the
+    // diagnostic firmware did NOT alter the Gaia regulator protection settings.
+    diag["ioutWarnLimitA"] = 28.0f;
+    diag["ioutFaultLimitA"] = 33.0f;
+}
 
 esp_err_t GET_V2_dashboard(httpd_req_t *req)
 {
@@ -36,6 +86,7 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
     uint64_t current_timestamp = 0;
     uint32_t history_limit     = 0;
     bool     history_requested = false;
+    bool     gaia_diag_only    = false;
     uint64_t history_span_ms   = DEFAULT_HISTORY_SPAN_MS;
     char     query_str[128];
     if (httpd_req_get_url_query_str(req, query_str, sizeof(query_str)) == ESP_OK) {
@@ -56,6 +107,9 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         if (httpd_query_key_value(query_str, "cur", param, sizeof(param)) == ESP_OK) {
             current_timestamp = strtoull(param, NULL, 10);
         }
+        if (httpd_query_key_value(query_str, "gaiaDiag", param, sizeof(param)) == ESP_OK) {
+            gaia_diag_only = strcmp(param, "0") != 0;
+        }
     }
 
     Board*   board   = SYSTEM_MODULE.getBoard();
@@ -64,6 +118,19 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
 
     PSRAMAllocator allocator;
     JsonDocument doc(&allocator);
+
+#ifdef NERDAXEGAIA
+    if (strcmp(board->getDeviceModel(), "NerdAxeGaia") == 0) {
+        NerdaxeGaia *gaia = static_cast<NerdaxeGaia *>(board);
+        if (gaia_diag_only) {
+            JsonObject diag = doc["gaiaVrDiagnostics"].to<JsonObject>();
+            addGaiaVrDiagnostics(diag, gaia);
+            return sendJsonResponse(req, doc);
+        }
+    }
+#else
+    (void)gaia_diag_only;
+#endif
 
     // --- system ---
     {
@@ -91,8 +158,6 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         perf["asicCount"]       = board->getAsicCount();
         perf["smallCoreCount"]  = board->getAsics() ? board->getAsics()->getSmallCoreCount() : 0;
 
-        // per-chip valid hashrate + hardware error hashrate (both GH/s) from the
-        // ASIC counters. total = hashRate + errorHashRate.
         JsonArray chips = perf["chips"].to<JsonArray>();
         for (int i = 0; i < board->getAsicCount(); i++) {
             JsonObject chip = chips.add<JsonObject>();
@@ -107,13 +172,13 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         pwr["watts"]             = POWER_MANAGEMENT_MODULE.getPower();
         pwr["min"]               = board->getMinPin();
         pwr["max"]               = board->getMaxPin();
-        pwr["voltage"]           = POWER_MANAGEMENT_MODULE.getVoltage() / 1000.0f; // V
+        pwr["voltage"]           = POWER_MANAGEMENT_MODULE.getVoltage() / 1000.0f;
         pwr["voltageMin"]        = board->getMinVin();
         pwr["voltageMax"]        = board->getMaxVin();
-        pwr["currentA"]          = POWER_MANAGEMENT_MODULE.getCurrent() / 1000.0f; // A
+        pwr["currentA"]          = POWER_MANAGEMENT_MODULE.getCurrent() / 1000.0f;
         pwr["currentAMin"]       = board->getMinCurrentA();
         pwr["currentAMax"]       = board->getMaxCurrentA();
-        pwr["coreVoltageActual"] = board->getVout(); // V
+        pwr["coreVoltageActual"] = board->getVout();
     }
 
     // --- thermal ---
@@ -124,7 +189,7 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         therm["vrTempInt"] = POWER_MANAGEMENT_MODULE.getVRTempInt();
         {
             JsonArray asic_temps = therm["asicTemps"].to<JsonArray>();
-            for (int i = 0; i < board->getAsicCount(); i++) {
+            for (int i = 0;i < board->getAsicCount();i++) {
                 asic_temps.add(board->getChipTemp(i));
             }
         }
@@ -138,18 +203,23 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         }
     }
 
+#ifdef NERDAXEGAIA
+    if (strcmp(board->getDeviceModel(), "NerdAxeGaia") == 0) {
+        NerdaxeGaia *gaia = static_cast<NerdaxeGaia *>(board);
+        JsonObject diag = doc["gaiaVrDiagnostics"].to<JsonObject>();
+        addGaiaVrDiagnostics(diag, gaia);
+    }
+#endif
+
     // --- stratum ---
     {
         JsonObject stratum = doc["stratum"].to<JsonObject>();
         STRATUM_MANAGER->getManagerInfoJson(stratum, true);
 
-        // Enrich each pool entry with host / port / user from NVS config
         char *urls[2]  = { Config::getStratumURL(), Config::getStratumFallbackURL() };
         char *users[2] = { Config::getStratumUser(), Config::getStratumFallbackUser() };
         int   ports[2] = { (int) Config::getStratumPortNumber(), (int) Config::getStratumFallbackPortNumber() };
 
-        // the managers report both pools in config order (0 = primary,
-        // 1 = fallback/secondary), so the array index is the config index
         JsonArray pools = stratum["pools"].as<JsonArray>();
         for (int i = 0; i < (int) pools.size() && i < 2; i++) {
             JsonObject pool = pools[i].as<JsonObject>();
@@ -203,7 +273,6 @@ esp_err_t GET_V2_dashboard(httpd_req_t *req)
         }
     }
 
-    // --- history (optional, same query params as /api/system/info) ---
     if (!shutdown && history_requested) {
         uint64_t end_timestamp = start_timestamp + history_span_ms;
         JsonObject json_history = doc["history"].to<JsonObject>();
